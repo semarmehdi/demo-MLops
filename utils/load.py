@@ -20,10 +20,7 @@ def load_employees(df_processed):
     s3_prefix_predictions = os.getenv("IBM_ATTRITION_S3_PRED_PREFIX")
 
     # Configuration Postgres / Neon
-    db_url = os.getenv(
-        "DATABASE_URL",
-        default="postgresql://neondb_owner:npg_0HLv6RGbCcPn@ep-cold-cherry-agr3ixjk-pooler.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require",
-    )
+    db_url = os.getenv("DATABASE_URL")
     table_name = os.getenv("DB_TARGET_TABLE", default="ibm_attrition_predictions")
 
     # Génération du nom de fichier unique basé sur le timestamp actuel
