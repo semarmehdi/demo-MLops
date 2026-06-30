@@ -1,558 +1,413 @@
-# 🪐 Demo MLOps — IBM Attrition
+# Demo MLOps — Prédiction d'attrition (IBM HR)
 
-Pipeline MLOps complet de bout en bout : entraînement d'un modèle de prédiction
-d'attrition (départ d'un employé), suivi des expériences avec **MLflow**, exposition
-du modèle via une **API FastAPI**, et **pipeline ETL** qui collecte des données,
-les enrichit avec les prédictions, et les stocke sur **S3** + **PostgreSQL (Neon)**.
-Le tout testé et industrialisé via **GitHub Actions** et déployé sur **Hugging Face Spaces**.
-
----
-
-## Architecture
-
-```
-                    ┌──────────────────────────────┐
-                    │   MLflow Tracking Server      │
-                    │   (HF Space - Docker)         │
-                    │   Backend  : Neon Postgres    │
-                    │   Artifacts: S3               │
-                    └───────────┬──────────────────┘
-                                │ log / register
-                                │
-   (1) ENTRAÎNEMENT LOCAL ──────┘
-        train/train.py
-                                │ load model @production
-                                ▼
-                    ┌──────────────────────────────┐
-                    │   API Modèle (FastAPI)        │
-                    │   (HF Space - Docker)         │
-                    │   GET /  GET /preview         │
-                    │   POST /predict               │
-                    └───────────┬──────────────────┘
-                                ▲ POST /predict
-                                │
-   (2) API DONNÉES             │
-   (HF Space)                  │
-   GET /current-employee ──────┤
-                                │
-   (3) PIPELINE ETL  ──────────┘
-        etl.py + utils/
-        ├── extract  → API données  + backup JSON sur S3
-        ├── transform→ appelle l'API modèle ligne par ligne
-        └── load     → CSV sur S3 + INSERT dans Neon Postgres
-```
-
-Trois services sont déployés sur Hugging Face Spaces (le serveur MLflow, l'API
-modèle, l'API données) et un pipeline batch (l'ETL) tourne en local, dans Docker,
-ou dans la CI.
+**Livrable de certification**
+Titre AIA — Architecte en Intelligence Artificielle
+Bloc 4 — MLOps (industrialisation, déploiement, monitoring et réentraînement)
+Auteur : **Ahmed Mehdi SEMAR**
 
 ---
 
-## Structure du projet
+## 1. Contexte et objectif
+
+Ce projet implémente une chaîne MLOps de bout en bout autour d'un cas métier RH :
+prédire le risque de départ d'un employé (*attrition*) à partir du jeu de données
+public IBM HR Attrition.
+
+L'objectif n'est pas seulement d'entraîner un modèle, mais de couvrir l'ensemble du
+cycle de vie : entraînement et suivi d'expériences (MLflow), exposition du modèle via
+une API REST (FastAPI), pipeline de données batch (ETL), industrialisation par
+intégration continue (GitHub Actions), monitoring de dérive (Evidently) et
+réentraînement automatisé.
+
+Le projet est réparti sur **deux dépôts complémentaires** :
+
+| Dépôt | Rôle |
+| --- | --- |
+| **demo-MLops** (ce dépôt) | Infrastructure de service : pipeline ETL, API modèle, serveur MLflow, CI/CD, tests |
+| [**train-repo**](https://github.com/semarmehdi/train-repo) | (Ré)entraînement automatisé et monitoring de dérive (Evidently) |
+
+---
+
+## 2. Architecture
+
+```
+                      +--------------------------------+
+                      |   Serveur MLflow Tracking      |
+                      |   (HF Space - Docker)          |
+                      |   Backend  : Neon PostgreSQL   |
+                      |   Artifacts: S3                |
+                      +---------------+----------------+
+              log / register          |  charge le modèle @production
+        +----------------------------+ +------------------------------+
+        |                                                             |
++-------+---------------------+                          +------------v-------------+
+|  train-repo                 |                          |  API Modèle (FastAPI)    |
+|  train.py (split, tuning,   |                          |  (HF Space - Docker)     |
+|  metriques, alias=challenger)|                         |  POST /predict           |
+|  monitoring.yaml (Evidently)|                          +------------+-------------+
++-------+---------------------+                                       ^ POST /predict
+        ^ drift -> gh workflow run                                    |
+        |                                                +------------+-------------+
+        |  lit les predictions de prod (S3)              |  Pipeline ETL (ce depot) |
+        +------------------------------------------------+  etl.py + utils/         |
+                                                         |  extract -> API donnees  |
+                            +----------------------------+  transform -> API modele |
+                            |  API Donnees (HF Space)    |  load -> S3 + Neon        |
+                            |  GET /current-employee     +--------------------------+
+                            +----------------------------+
+```
+
+Quatre composants sont déployés en tant que Spaces Docker sur Hugging Face (serveur
+MLflow, API modèle, API données) ; le pipeline ETL s'exécute en local, dans Docker
+ou dans la CI. La boucle de monitoring et de réentraînement est portée par le dépôt
+`train-repo`.
+
+---
+
+## 3. Pile technique
+
+- **Modèle** : scikit-learn (RandomForestClassifier, pipeline de preprocessing)
+- **Suivi & registry** : MLflow (backend Neon PostgreSQL, artifact store S3)
+- **Service modèle** : FastAPI, conteneurisé (Docker), déployé sur Hugging Face Spaces
+- **Données** : Amazon S3 (backups bruts et prédictions), PostgreSQL Neon (table cible)
+- **Orchestration batch** : script ETL Python conteneurisé
+- **CI/CD** : GitHub Actions
+- **Monitoring** : Evidently (dérive des données et des prédictions)
+
+---
+
+## 4. Structure du dépôt
 
 ```
 demo-MLops/
 ├── .github/workflows/
-│   └── ci.yaml                 # CI : tests + build Docker + run ETL
-├── ibmattritionapi/            # (sous-repo HF) API qui sert les données employés
-├── mlflow/                     # Serveur MLflow à déployer sur HF
+│   └── ci.yaml                 # CI : tests + build Docker + exécution ETL
+├── mlflow/                     # Serveur MLflow (image à déployer sur HF)
 │   ├── Dockerfile
-│   ├── requirements.txt
-│   └── .env                    # (local, ignoré par git)
-├── mlflow_HF/                  # (clone du repo HF du Space MLflow)
-├── model_api/                  # API du modèle à déployer sur HF
+│   └── requirements.txt
+├── model_api/                  # API du modèle (à déployer sur HF)
 │   ├── app.py
 │   ├── Dockerfile
-│   ├── requirements.txt
-│   └── .env                    # (local, ignoré par git)
-├── model_api_HF/               # (clone du repo HF du Space API modèle)
-├── train/
-│   ├── train.py                # entraînement local -> log vers MLflow
-│   ├── requirements.txt
-│   ├── temp/                   # artefacts locaux (ignoré par git)
-│   └── .env
-├── utils/                      # package ETL
+│   └── requirements.txt
+├── train/                      # Entraînement initial de référence (bootstrap)
+│   ├── train.py
+│   └── requirements.txt
+├── utils/                      # Package ETL
 │   ├── __init__.py
 │   ├── extract.py
 │   ├── transform.py
 │   └── load.py
 ├── tests/
-│   ├── test_smoke_apis.py      # tests réels des 2 APIs (skip si env absent)
-│   └── test_transform.py       # tests logique pure (zéro mock)
+│   ├── test_transform.py       # Tests de logique pure (sans réseau ni mock)
+│   └── test_smoke_apis.py      # Smoke tests des APIs (skip si env absent)
 ├── conftest.py
-├── etl.py                      # point d'entrée du pipeline ETL
-├── Dockerfile                  # image qui exécute l'ETL une fois
+├── etl.py                      # Point d'entrée du pipeline ETL
+├── Dockerfile                  # Image d'exécution de l'ETL
 ├── requirements.txt
 ├── requirements-tests.txt
-├── .gitignore
-└── .env                        # (local, ignoré par git)
+└── .env.example
 ```
 
----
-
-## ✅ Prérequis
-
-- Un compte **Hugging Face** (pour les 3 Spaces Docker)
-- Un compte **AWS** avec un **bucket S3** et une paire de clés IAM
-- Une base **PostgreSQL** gratuite sur **[Neon](https://neon.tech)**
-- **Python 3.11** en local (idéalement via conda)
-- **Docker** installé en local
+> L'entraînement de référence sous `train/` sert à amorcer le premier modèle. Le
+> **(ré)entraînement automatisé** (split stratifié, gestion du déséquilibre, tuning,
+> métriques) et le **monitoring** sont industrialisés dans le dépôt `train-repo`.
 
 ---
 
-## 🔐 Variables d'environnement (référence)
+## 5. Prérequis
 
-> ⚠️ **Aucun `.env` ni secret ne doit être commité.** Ils sont tous ignorés par
-> `.gitignore`. En CI, ils viennent des _GitHub Secrets/Variables_ ; sur HF, des
-> _Settings → Variables and secrets_ du Space.
+- Un compte **Hugging Face** (pour les Spaces Docker)
+- Un compte **AWS** avec un bucket **S3** et une paire de clés IAM
+- Une base **PostgreSQL** (offre gratuite **Neon**)
+- **Python 3.11** et **Docker** en local
+
+---
+
+## 6. Variables d'environnement (référence)
+
+Aucun fichier `.env` ni secret n'est versionné (tous ignorés par `.gitignore`).
+En CI, les valeurs proviennent des *GitHub Secrets/Variables* ; sur Hugging Face,
+des *Settings → Variables and secrets* du Space.
 
 **Racine `.env` (ETL)**
 
-| Variable                                   | Exemple                                             | Rôle                      |
-| ------------------------------------------ | --------------------------------------------------- | ------------------------- |
-| `IBM_ATTRITION_BASE_URL`                   | `https://semarmehdi-ibmattritionapi.hf.space`       | URL de l'API données      |
-| `IBM_ATTRITION_ENDPOINT`                   | `/current-employee`                                 | Endpoint données          |
-| `IBM_ATTRITION_BATCH_SIZE`                 | `20`                                                | Nb de lignes collectées   |
-| `IBM_ATTRITION_SLEEP_SECONDS`              | `1.0`                                               | Pause entre 2 pulls       |
-| `IBM_ATTRITION_MODEL_API_BASE_URL`         | `https://semarmehdi-model-api.hf.space`             | URL de l'API modèle       |
-| `IBM_ATTRITION_MODEL_API_PREDICT_ENDPOINT` | `/predict`                                          | Endpoint de prédiction    |
-| `IBM_ATTRITION_MODEL_API_TIMEOUT`          | `120`                                               | Timeout des appels modèle |
-| `S3BucketName`                             | `mon-bucket`                                        | Bucket S3                 |
-| `IBM_ATTRITION_S3_PREFIX`                  | `raw/ibm`                                           | Préfixe des backups bruts |
-| `IBM_ATTRITION_S3_PRED_PREFIX`             | `clean/ibm`                                         | Préfixe des prédictions   |
-| `AWS_ACCESS_KEY_ID`                        | `AKIA...`                                           | Clé IAM                   |
-| `AWS_SECRET_ACCESS_KEY`                    | `...`                                               | Secret IAM                |
-| `AWS_DEFAULT_REGION`                       | `eu-west-3`                                         | Région S3                 |
-| `DATABASE_URL`                             | `postgresql://user:pwd@host/neondb?sslmode=require` | Connexion Neon            |
-| `DB_TARGET_TABLE`                          | `ibm_attrition_predictions`                         | Table cible               |
+| Variable | Exemple | Rôle |
+| --- | --- | --- |
+| `IBM_ATTRITION_BASE_URL` | `https://semarmehdi-ibmattritionapi.hf.space` | URL de l'API données |
+| `IBM_ATTRITION_ENDPOINT` | `/current-employee` | Endpoint données |
+| `IBM_ATTRITION_BATCH_SIZE` | `20` | Nombre de lignes collectées |
+| `IBM_ATTRITION_SLEEP_SECONDS` | `1.0` | Pause entre deux appels |
+| `IBM_ATTRITION_MODEL_API_BASE_URL` | `https://semarmehdi-model-api.hf.space` | URL de l'API modèle |
+| `IBM_ATTRITION_MODEL_API_PREDICT_ENDPOINT` | `/predict` | Endpoint de prédiction |
+| `IBM_ATTRITION_MODEL_API_TIMEOUT` | `120` | Timeout des appels modèle |
+| `S3BucketName` | `mon-bucket` | Bucket S3 |
+| `IBM_ATTRITION_S3_PREFIX` | `raw/ibm` | Préfixe des backups bruts |
+| `IBM_ATTRITION_S3_PRED_PREFIX` | `clean/ibm` | Préfixe des prédictions |
+| `AWS_ACCESS_KEY_ID` | `AKIA...` | Clé IAM |
+| `AWS_SECRET_ACCESS_KEY` | `...` | Secret IAM |
+| `AWS_DEFAULT_REGION` | `eu-west-3` | Région S3 |
+| `DATABASE_URL` | `postgresql://user:pwd@host/neondb?sslmode=require` | Connexion Neon |
+| `DB_TARGET_TABLE` | `ibm_attrition_predictions` | Table cible |
 
-> ⚠️ **Important : format `.env` pour Docker.** Avec `docker run --env-file .env`,
-> n'entoure **jamais** les valeurs de guillemets et ne mets pas d'espace autour du
-> `=`. Une URL entre guillemets devient `"https://..."` (guillemets inclus) et
-> `requests` plante avec _No connection adapters were found_.
+Variables optionnelles de l'ordonnanceur ETL (voir section 9.6) :
+`ETL_LOOP_ITERATIONS`, `ETL_LOOP_INTERVAL_SECONDS`, `ETL_FAIL_FAST`.
+
+> **Format `.env` pour Docker.** Avec `docker run --env-file .env`, ne jamais entourer
+> les valeurs de guillemets ni mettre d'espace autour du `=`. Une URL entre guillemets
+> casse `requests` (*No connection adapters were found*).
 
 **`mlflow/.env` (serveur de tracking)**
 
-| Variable                                                             | Rôle                                      |
-| -------------------------------------------------------------------- | ----------------------------------------- |
-| `BACKEND_STORE_URI`                                                  | URL Neon (stocke runs, params, métriques) |
-| `ARTIFACT_ROOT`                                                      | `s3://mon-bucket/mlflow-artifacts`        |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION` | Accès S3                                  |
+| Variable | Rôle |
+| --- | --- |
+| `BACKEND_STORE_URI` | URL Neon (runs, paramètres, métriques) |
+| `ARTIFACT_ROOT` | `s3://mon-bucket/mlflow-artifacts` |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION` | Accès S3 |
 
 **`model_api/.env` et `train/.env`**
 
-| Variable                                                             | Rôle                                               |
-| -------------------------------------------------------------------- | -------------------------------------------------- |
-| `MLFLOW_TRACKING_URI`                                                | URL du Space MLflow                                |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION` | Pour télécharger les artefacts du modèle depuis S3 |
+| Variable | Rôle |
+| --- | --- |
+| `MLFLOW_TRACKING_URI` | URL du Space MLflow |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION` | Téléchargement des artefacts modèle depuis S3 |
 
 ---
 
-## 🧱 Étape 0 — Préparer le stockage
+## 7. Mise en route
 
-### a) Base Neon (Postgres)
+### 7.0 Préparer le stockage
 
-1. Crée deux projets sur [neon.tech](https://neon.tech).
-2. Récupère les **connection string** (format `postgresql://...sslmode=require`).
-3. Une servira au **backend MLflow** (`BACKEND_STORE_URI`) et l'autre à l'**ETL** (`DATABASE_URL`).
+1. **Neon** : créer deux bases — l'une pour le backend MLflow (`BACKEND_STORE_URI`),
+   l'autre pour l'ETL (`DATABASE_URL`). Récupérer les chaînes de connexion
+   (`postgresql://...sslmode=require`).
+2. **S3** : créer un bucket dans une région, puis un utilisateur IAM avec une policy
+   `s3:PutObject` / `s3:GetObject` / `s3:ListBucket` ; noter la paire de clés.
 
-### b) Bucket S3
+### 7.1 Déployer le serveur MLflow (Hugging Face, SDK Docker)
 
-1. Crée un bucket S3 (ex. `mon-bucket`) dans une région (ex. `eu-west-3`).
-2. Crée un utilisateur IAM avec une policy donnant l'accès à ce bucket
-   (`s3:PutObject`, `s3:GetObject`, `s3:ListBucket`).
-3. Note la paire `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
+Le serveur centralise les entraînements ; backend Neon (métadonnées) et S3
+(artefacts). Renseigner dans les *Secrets* du Space : `BACKEND_STORE_URI`,
+`ARTIFACT_ROOT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`.
+Une fois le Space *Running*, son URL est le `MLFLOW_TRACKING_URI`.
 
----
+### 7.2 Entraîner le modèle
 
-## 🧪 Étape 1 — Déployer le serveur MLflow sur Hugging Face
-
-Le serveur MLflow centralise tous tes entraînements. Il utilise Neon comme
-**backend store** (métadonnées) et S3 comme **artifact store** (modèles, fichiers).
-
-### 1.1 Créer le Space
-
-1. Sur HF : **New Space** → SDK **Docker** → visibilité au choix.
-2. Clone-le en local (c'est ton dossier `mlflow_HF/`).
-
-### 1.2 Le `mlflow/Dockerfile`
-
-Exemple type (adapte à ce que tu as déjà) :
-
-```dockerfile
-FROM python:3.11
-
-WORKDIR /home/app
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends nano unzip curl \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY . .
-
-RUN curl -fsSL https://get.deta.dev/cli.sh | sh
-
-RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-RUN unzip awscliv2.zip
-RUN ./aws/install
-
-
-
-# THIS IS SPECIFIC TO HUGGINFACE
-# We create a new user named "user" with ID of 1000
-RUN useradd -m -u 1000 user
-# We switch from "root" (default user when creating an image) to "user"
-USER user
-# We set two environmnet variables
-# so that we can give ownership to all files in there afterwards
-# we also add /home/user/.local/bin in the $PATH environment variable
-# PATH environment variable sets paths to look for installed binaries
-# We update it so that Linux knows where to look for binaries if we were to install them with "user".
-ENV HOME=/home/user \
-    PATH=/home/user/.local/bin:$PATH
-
-# We set working directory to $HOME/app (<=> /home/user/app)
-WORKDIR $HOME/app
-
-# Copy all local files to /home/user/app with "user" as owner of these files
-# Always use --chown=user when using HUGGINGFACE to avoid permission errors
-COPY --chown=user . $HOME/app
-
-
-COPY requirements.txt /dependencies/requirements.txt
-RUN pip install -r /dependencies/requirements.txt
-
-ENV AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
-ENV AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
-ENV BACKEND_STORE_URI=$BACKEND_STORE_URI
-ENV ARTIFACT_ROOT=$ARTIFACT_ROOT
-
-CMD mlflow server -p $PORT \
-    --host 0.0.0.0 \
-    --backend-store-uri $BACKEND_STORE_URI \
-    --default-artifact-root $ARTIFACT_ROOT \
-    --allowed-hosts "*"
-```
-
-### 1.3 Renseigner les secrets du Space
-
-Dans **Settings → Variables and secrets** du Space, ajoute (en _Secrets_) :
-`BACKEND_STORE_URI`, `ARTIFACT_ROOT`, `AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`.
-
-### 1.4 Pousser et vérifier
+Pour l'amorçage, l'entraînement de référence est sous `train/`. Pour le pipeline
+d'entraînement complet (split stratifié, `class_weight="balanced"`, `GridSearchCV`,
+métriques precision/recall/F1/ROC-AUC et matrice de confusion loggées dans MLflow),
+voir le dépôt **train-repo**.
 
 ```bash
-cd mlflow_HF
-# copie ton Dockerfile + requirements, commit, push
-git add .
-git commit -m "mlflow server"
-git push
-```
-
-Une fois le Space _Running_, ouvre son URL : tu dois voir l'**interface MLflow**, tu as trois petits points en haut à droite. Clique sur "embbed this space".
-Cette URL est ton `MLFLOW_TRACKING_URI`.
-
----
-
-## 🏋️ Étape 2 — Entraîner le modèle en local
-
-L'entraînement se fait **sur ta machine**, mais tout est **loggé vers le serveur
-MLflow distant** (HF). Le modèle entraîné est stocké sur S3 via MLflow.
-
-### 2.1 Préparer l'environnement
-
-```bash
-conda create -n demo-mlflow-train python=3.11 -y
-conda activate demo-mlflow-train
+conda create -n demo-mlflow-train python=3.11 -y && conda activate demo-mlflow-train
 pip install -r train/requirements.txt
+python train/train.py
 ```
 
-### 2.2 Configurer le `.env` de l'entraînement
+Le modèle est enregistré dans le Model Registry sous le nom `ibm_attrition_detector`.
 
-`train/.env` :
+### 7.3 Promouvoir le modèle en production
 
-```dotenv
-MLFLOW_TRACKING_URI=https://<ton-space-mlflow>.hf.space
-AWS_ACCESS_KEY_ID=AKIA...
-AWS_SECRET_ACCESS_KEY=...
-```
-
-### 2.3 Lancer l'entraînement
-
-```bash
-cd train
-python train.py
-```
-
-**Ce qui se passe, étape par étape :**
-
-1. **Chargement des variables** — `load_dotenv()` lit `train/.env`, ce qui pointe
-   MLflow vers le serveur HF (`MLFLOW_TRACKING_URI`).
-2. **Création / sélection d'une expérience** — `mlflow.set_experiment("ibm_attrition")`.
-3. **Chargement des données** — le dataset IBM HR Attrition (Excel sur S3 public).
-4. **Préparation** — split train/test, pipeline de preprocessing (encodage des
-   variables catégorielles + scaling), puis le modèle (ex. régression logistique
-   ou random forest).
-5. **Démarrage d'un run** — `with mlflow.start_run():` ; on active
-   `mlflow.sklearn.autolog()` (ou on logge manuellement params + métriques).
-6. **Entraînement** — `model.fit(X_train, y_train)`.
-7. **Évaluation** — calcul accuracy / f1 / recall sur le test, loggés dans MLflow.
-8. **Log du modèle** — `mlflow.sklearn.log_model(model, name="model", registered_model_name="ibm_attrition_detector")`.
-   → Le modèle est **uploadé sur S3** et **enregistré** dans le Model Registry.
-
-### 2.4 Vérifier dans l'UI MLflow
-
-Ouvre le Space MLflow → onglet **Experiments** : ton run apparaît avec ses
-métriques. Onglet **Models** : la version du modèle `ibm_attrition_detector`
-est listée.
-
----
-
-## 🚀 Étape 3 — Promouvoir le modèle en "production"
-
-L'API modèle charge le modèle via l'alias `@production`
-(`models:/ibm_attrition_detector@production`). Il faut donc **attacher cet alias**
-à la version que tu veux servir.
-
-**Via l'UI MLflow :** Models → `ibm_attrition_detector` → la version voulue →
-_Aliases_ → ajoute `production`.
-
-**Ou via code :**
+L'API modèle charge `models:/ibm_attrition_detector@production`. Il faut attacher
+l'alias `production` à la version voulue, via l'UI MLflow ou par code :
 
 ```python
 from mlflow import MlflowClient
-client = MlflowClient()  # lit MLFLOW_TRACKING_URI
-client.set_registered_model_alias(
-    name="ibm_attrition_detector",
-    alias="production",
-    version=1,            # la version à promouvoir
+MlflowClient().set_registered_model_alias(
+    name="ibm_attrition_detector", alias="production", version=1
 )
 ```
 
-> 💡 Quand tu réentraînes plus tard, tu crées une **nouvelle version**. Il suffit
-> de déplacer l'alias `production` dessus pour que l'API serve le nouveau modèle
-> au prochain redémarrage — sans changer une ligne de code.
+Au réentraînement, une nouvelle version est créée ; déplacer l'alias `production`
+suffit à servir le nouveau modèle au prochain redémarrage de l'API, sans modifier
+le code (mécanisme de **rollback** : on repointe l'alias sur une version antérieure).
 
----
+### 7.4 Déployer l'API du modèle (Hugging Face, SDK Docker)
 
-## 🤖 Étape 4 — Déployer l'API du modèle sur Hugging Face
+`model_api/app.py` (FastAPI) charge le modèle `@production` au démarrage et expose
+`POST /predict`, qui renvoie `prediction`, `proba_0` et `proba_1`. Secrets du Space :
+`MLFLOW_TRACKING_URI`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
 
-L'API (`model_api/app.py`, FastAPI) charge le modèle `@production` au démarrage et
-expose `/predict`. Elle renvoie `prediction`, `proba_0` et `proba_1`.
-
-### 4.1 Créer le Space
-
-New Space → SDK **Docker** → clone-le (ton dossier `model_api_HF/`).
-
-### 4.2 Le `model_api/Dockerfile`
-
-```dockerfile
-FROM python:3.11-slim
-
-RUN apt-get update -y
-RUN apt-get install nano unzip curl -y
-
-# # THIS IS SPECIFIC TO HUGGINFACE
-# # We create a new user named "user" with ID of 1000
-# RUN useradd -m -u 1000 user
-# # We switch from "root" (default user when creating an image) to "user"
-# USER user
-# # We set two environmnet variables
-# # so that we can give ownership to all files in there afterwards
-# # we also add /home/user/.local/bin in the $PATH environment variable
-# # PATH environment variable sets paths to look for installed binaries
-# # We update it so that Linux knows where to look for binaries if we were to install them with "user".
-# ENV HOME=/home/user \
-#     PATH=/home/user/.local/bin:$PATH
-
-# We set working directory to $HOME/app (<=> /home/user/app)
-WORKDIR /home/app
-
-# Leverage layer caching: copy only reqs first
-COPY requirements.txt requirements.txt
-RUN pip install -r requirements.txt
-
-# # Copy all local files to /home/user/app with "user" as owner of these files
-# # Always use --chown=user when using HUGGINGFACE to avoid permission errors
-# COPY --chown=user . $HOME/app
-
-COPY app.py /home/app/app.py
-
-CMD ["bash","-lc","fastapi run app.py --host 0.0.0.0 --port ${PORT}"]
-```
-
-### 4.3 Secrets du Space
-
-`MLFLOW_TRACKING_URI`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, (pour télécharger le modèle depuis S3).
-
-### 4.4 Pousser et tester
-
-```bash
-cd model_api_HF
-git add .
-git commit -m "model api"
-git push
-```
-
-Une fois _Running_, teste la doc interactive : `https://<space>.hf.space/docs`,
-ou en ligne de commande :
+Exemple d'appel :
 
 ```bash
 curl -X POST https://<space>.hf.space/predict \
   -H "Content-Type: application/json" \
-  -d '{"Age":36,"BusinessTravel":"Travel_Rarely","DailyRate":852,"Department":"Research & Development","DistanceFromHome":5,"Education":4,"EducationField":"Life Sciences","EmployeeCount":1,"EmployeeNumber":51,"EnvironmentSatisfaction":2,"Gender":"Female","HourlyRate":82,"JobInvolvement":2,"JobLevel":1,"JobRole":"Research Scientist","JobSatisfaction":1,"MaritalStatus":"Married","MonthlyIncome":3419,"MonthlyRate":13072,"NumCompaniesWorked":9,"Over18":"Y","OverTime":"Yes","PercentSalaryHike":14,"PerformanceRating":3,"RelationshipSatisfaction":4,"StandardHours":80,"StockOptionLevel":1,"TotalWorkingYears":6,"TrainingTimesLastYear":3,"WorkLifeBalance":4,"YearsAtCompany":1,"YearsInCurrentRole":1,"YearsSinceLastPromotion":0,"YearsWithCurrManager":0}'
+  -d '{"Age":36,"BusinessTravel":"Travel_Rarely", ...}'
+# -> { "prediction": 0, "proba_0": 0.87, "proba_1": 0.13 }
 ```
 
-Réponse attendue :
+La documentation interactive (Swagger) est disponible sur `https://<space>.hf.space/docs`.
 
-```json
-{ "prediction": 0, "proba_0": 0.87, "proba_1": 0.13 }
-```
+### 7.5 L'API de données
 
----
+Le Space `ibmattritionapi` sert des lignes d'employés via `GET /current-employee`,
+au format `{"columns": [...], "data": [[...]]}`. C'est la source de l'ETL.
+URL de base : `https://semarmehdi-ibmattritionapi.hf.space` (déjà déployée).
 
-## 📡 Étape 5 — L'API de données
+### 7.6 Le pipeline ETL
 
-L'api `ibmattritionapi/` contient l'API qui sert des lignes d'employés (un
-Space HF séparé). Elle expose un endpoint (ex. `/current-employee`) qui renvoie un
-employé au format `{"columns": [...], "data": [[...]]}`. C'est la **source** de
-l'ETL. Déploie-la de la même façon (Space Docker), puis renseigne son URL dans
-`IBM_ATTRITION_BASE_URL` / `IBM_ATTRITION_ENDPOINT`.
-Voici l'url de base : `https://semarmehdi-ibmattritionapi.hf.space`
-Attention vous n'avez pas besoin de déployer cette api.
-Contactez-moi par message si elle ne tourne plus.
+`etl.py` orchestre le package `utils/` :
 
----
+1. **extract** — interroge l'API données `BATCH_SIZE` fois, sauvegarde un backup
+   JSON brut sur S3, renvoie l'artefact en mémoire.
+2. **transform** — reconstruit un DataFrame, appelle l'API modèle ligne par ligne,
+   ajoute `prediction` / `proba_0` / `proba_1`.
+3. **load** — exporte un CSV sur S3 et insère les lignes dans Neon (mode append).
 
-## 🔄 Étape 6 — Le pipeline ETL
-
-`etl.py` orchestre les 3 étapes du package `utils/` :
-
-1. **extract** (`extract.py`) — interroge l'API données `BATCH_SIZE` fois,
-   sauvegarde un backup JSON brut sur S3, et renvoie l'artefact en mémoire.
-2. **transform** (`transform.py`) — reconstruit un DataFrame, appelle l'API modèle
-   ligne par ligne, et ajoute `prediction` / `proba_0` / `proba_1`.
-3. **load** (`load.py`) — exporte le DataFrame en CSV sur S3, crée la table Neon
-   si besoin, et insère les lignes (mode `append`).
-
-### 6.1 Tester en local (sans Docker)
+Exécution en local ou dans Docker :
 
 ```bash
-conda activate demo-mlflow-train
 pip install -r requirements.txt
-python etl.py        # lit le .env de la racine via load_dotenv()
-```
-
-### 6.2 Tester en local avec Docker
-
-```bash
+python etl.py
+# ou
 docker build -t ibm-attrition-etl .
 docker run --rm --env-file .env ibm-attrition-etl
 ```
 
-> Rappel : `.env` **sans guillemets** pour `--env-file`.
+L'ETL embarque un **ordonnanceur applicatif borné** qui simule un cadencement de
+production sans dépendance externe. Il est piloté par trois variables :
 
-### 6.3 Note Postgres importante
+| Variable | Prod (défaut image) | CI |
+| --- | --- | --- |
+| `ETL_LOOP_ITERATIONS` | `0` (boucle infinie) | `3` (le job se termine seul) |
+| `ETL_LOOP_INTERVAL_SECONDS` | `30` | `30` |
+| `ETL_FAIL_FAST` | `false` (résilient) | `true` (échoue au premier incident) |
 
-La table est créée avec des colonnes **entre guillemets** (`"Age"`, etc.) pour
-respecter la casse exacte de pandas. Si une ancienne table existe avec des colonnes
-en minuscules, supprime-la d'abord :
+L'arrêt sur signal (`SIGTERM` / `SIGINT`) est géré proprement : le cycle en cours se
+termine avant la sortie du conteneur.
 
-```sql
-DROP TABLE IF EXISTS public.ibm_attrition_predictions;
-```
-
-**Ou directement dans l'interface Neon à la main !**
-
-## 🧫 Étape 7 — Les tests
-
-Deux niveaux :
-
-- **`tests/test_transform.py`** — tests de **logique pure**, zéro mock, zéro réseau.
-  Idéal pour comprendre pytest (motif _Arrange / Act / Assert_).
-- **`tests/test_smoke_apis.py`** — _smoke tests_ qui appellent **réellement** les
-  deux APIs. Ils se **skippent** si les variables d'env ne sont pas définies.
+### 7.7 Les tests
 
 ```bash
 pip install -r requirements-tests.txt
 pytest -v
 ```
 
----
+- `tests/test_transform.py` : tests de logique pure (motif Arrange / Act / Assert),
+  sans réseau ni mock.
+- `tests/test_smoke_apis.py` : smoke tests appelant réellement les deux APIs, qui se
+  *skippent* automatiquement si les variables d'environnement sont absentes.
 
-## ⚙️ Étape 8 — CI/CD avec GitHub Actions
+### 7.8 CI/CD avec GitHub Actions
 
-Le workflow `.github/workflows/ci.yaml` se déclenche à chaque push/PR sur `main` :
-checkout → install → `pytest` → build Docker → run de l'ETL → listing de debug.
+Le workflow `.github/workflows/ci.yaml` se déclenche sur push et pull request vers
+`main` : checkout → installation → `pytest` → build Docker → exécution bornée de l'ETL.
 
-### 8.1 Où mettre les secrets et variables
+Les secrets et variables se définissent dans **Settings → Secrets and variables →
+Actions**, au niveau *Repository* (et non *Environment*). Règle de répartition : une
+valeur dont la fuite est un risque va en *Secret* (`AWS_*`, `DATABASE_URL`, URLs
+d'API) ; les paramètres non sensibles vont en *Variable* (`*_BATCH_SIZE`,
+`*_TIMEOUT`, `DB_TARGET_TABLE`).
 
-**Repo GitHub → Settings → Secrets and variables → Actions**, deux onglets :
-**Secrets** et **Variables**.
-
-> ℹ️ **Repository secrets, pas Environment secrets.** Sur cette page, GitHub
-> affiche deux blocs : _Environment secrets_ (fonctionnalité optionnelle des
-> "Environments", à ignorer ici) et _Repository secrets_. Utilise le bouton vert
-> **"New repository secret"** — aucun environnement à créer. Idem côté variables :
-> onglet _Variables_ → _New repository variable_. C'est ce niveau "repository" que
-> lisent `${{ secrets.NOM }}` et `${{ vars.NOM }}` sans configuration
-> supplémentaire. (Un _Environment_ ne sert que si tu veux ajouter une approbation
-> manuelle ou des règles de protection avant un déploiement — hors périmètre ici.)
-
-- **Secrets** (chiffrés, masqués dans les logs) : `AWS_ACCESS_KEY_ID`,
-  `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `DATABASE_URL`,
-  `IBM_ATTRITION_BASE_URL`, `IBM_ATTRITION_ENDPOINT`,
-  `IBM_ATTRITION_MODEL_API_BASE_URL`, `S3BUCKETNAME`, `IBM_ATTRITION_S3_PREFIX`,
-  `IBM_ATTRITION_S3_PRED_PREFIX`.
-  → appelés via `${{ secrets.NOM }}`.
-- **Variables** (en clair) : `IBM_ATTRITION_BATCH_SIZE`,
-  `IBM_ATTRITION_SLEEP_SECONDS`, `IBM_ATTRITION_MODEL_API_PREDICT_ENDPOINT`,
-  `IBM_ATTRITION_MODEL_API_TIMEOUT`, `DB_TARGET_TABLE`.
-  → appelés via `${{ vars.NOM }}`.
-
-Règle : si une fuite est un problème → **Secret**. Sinon → **Variable**.
-
-> ⚠️ Avec cette CI, **chaque push exécute réellement l'ETL** (écriture S3 +
-> insertion Neon + appels aux APIs). Pour un usage "prod", garder le `docker run`
-> en _smoke test_ et déplacer le vrai run dans un workflow `workflow_dispatch` /
-> `schedule` séparé.
+> **Recommandation prod.** Cette CI exécute réellement l'ETL à chaque push (écriture
+> S3, insertion Neon, appels API). Pour un usage industriel, conserver le `docker run`
+> en *smoke test* borné et déplacer le run réel dans un workflow `schedule` /
+> `workflow_dispatch` dédié.
 
 ---
 
-## 🔒 Sécurité — à ne pas oublier
+## 8. Monitoring et réentraînement
 
-- **Aucun secret dans le code ni dans les Dockerfiles.** Tout passe par les `.env`
-  (local), les _GitHub Secrets_ (CI) ou les _secrets HF_ (Spaces).
-- **`load.py`** : retirer le mot de passe Neon en dur dans le `default=` de
-  `DATABASE_URL`. Si ce mot de passe a déjà été poussé un jour, le **faire tourner**
-  côté Neon (le considérer comme compromis).
-- Avant le premier `git push`, vérifier qu'aucun secret n'est suivi :
-  ```bash
-  git ls-files | grep -E "\.env$|__pycache__"
-  ```
-  (ne doit rien renvoyer).
+Le monitoring et le réentraînement sont automatisés dans le dépôt **train-repo** et
+ferment la boucle MLOps :
+
+- **Détection de dérive (Evidently).** Un workflow planifié (`monitoring.yaml`)
+  agrège, sur une fenêtre glissante, les prédictions de production stockées sur S3,
+  les compare à la distribution de référence (jeu d'entraînement) et produit un
+  rapport HTML de *data drift* archivé en artefact et sur S3.
+- **Réentraînement conditionnel.** Si la part de colonnes dérivées dépasse un seuil,
+  le workflow déclenche automatiquement le pipeline d'entraînement
+  (`train.yaml`, via `gh workflow run`), qui produit une nouvelle version du modèle
+  enregistrée sous l'alias `challenger`.
+- **Périmètre de mesure.** En l'absence de labels réels en production, le monitoring
+  porte sur la **dérive des entrées** et la **dérive des prédictions**, et non sur
+  l'accuracy en ligne, qui nécessiterait la collecte a posteriori des départs réels.
 
 ---
 
-## ⚡ Démarrage rapide (TL;DR)
+## 9. Versioning et rollback
+
+Le Model Registry MLflow assure le versioning des modèles. Les **alias** matérialisent
+les états de service :
+
+- `challenger` : dernier modèle entraîné, non encore promu.
+- `production` : modèle effectivement servi par l'API.
+
+La promotion comme le **rollback** consistent à déplacer l'alias `production` vers la
+version cible — sans aucune modification de code, l'API rechargeant l'alias au
+redémarrage.
+
+---
+
+## 10. Sécurité
+
+- Aucun secret n'est présent dans le code ni dans les Dockerfiles ; tout passe par
+  les `.env` (local), les *GitHub Secrets* (CI) ou les *secrets HF* (Spaces).
+- `load.py` ne doit contenir **aucun mot de passe en dur** dans la valeur par défaut
+  de `DATABASE_URL`. Tout identifiant ayant pu être poussé doit être considéré comme
+  compromis et **renouvelé** côté Neon.
+- Avant tout `git push`, vérifier qu'aucun secret n'est suivi :
+  `git ls-files | grep -E "\.env$|__pycache__"` (ne doit rien retourner).
+
+---
+
+## 11. Couverture des attendus du Bloc 4
+
+| Attendu | Réalisation |
+| --- | --- |
+| Préparation des données et entraînement | Pipeline scikit-learn, split stratifié, gestion du déséquilibre, tuning, métriques (cf. train-repo) |
+| Déploiement (REST API, conteneurisé) | API FastAPI conteneurisée, déployée sur Hugging Face Spaces |
+| CI/CD | GitHub Actions : tests, build Docker, exécution ETL, pipeline de réentraînement |
+| Monitoring et alertes | Détection de dérive Evidently planifiée, rapports archivés |
+| Réentraînement automatisé | Déclenchement sur dérive (`monitoring.yaml` → `train.yaml`) |
+| Versioning et rollback | Model Registry MLflow + alias `challenger` / `production` |
+| Documentation API | Swagger interactif (`/docs`) + exemples |
+
+---
+
+## 12. Évolutions identifiées
+
+Pistes d'industrialisation, hors périmètre de la version remise (contraintes de temps) :
+
+- **Gate champion/challenger.** Comparer automatiquement le `challenger` au modèle
+  `production` sur un jeu de validation figé, et ne promouvoir que s'il est meilleur
+  (rollback automatique sinon). La promotion est aujourd'hui manuelle.
+- **Alerte active sur dérive.** Notification (e-mail SMTP ou webhook) en complément
+  des rapports archivés.
+- **CI à deux niveaux.** Pull request en *smoke test*, exécution réelle réservée à
+  `main` et au déclenchement manuel.
+- **Versioning des données.** DVC pour tracer explicitement les jeux de référence.
+- **Passage à l'échelle.** Migration du service depuis Hugging Face vers une cible
+  orchestrée (ECS / Kubernetes) pour la montée en charge et l'autoscaling.
+
+---
+
+## 13. Démarrage rapide
 
 ```bash
-# 1. Stockage : créer Neon + bucket S3
+# 1. Créer le stockage : base Neon + bucket S3
 # 2. Déployer le serveur MLflow (Space Docker)
 # 3. Entraîner et promouvoir le modèle
-conda create -n demo-mlflow-train python=3.11 -y && conda activate demo-mlflow-train
 pip install -r train/requirements.txt
-python train/train.py            # log vers MLflow + register
+python train/train.py                 # log + register dans MLflow
 # (promouvoir la version en alias 'production' via l'UI MLflow)
 
-# 4. Déployer l'API modèle + l'API données (Spaces Docker)
+# 4. Déployer l'API modèle et l'API données (Spaces Docker)
 
 # 5. Lancer l'ETL
 pip install -r requirements.txt
-python etl.py                    # ou : docker run --rm --env-file .env ibm-attrition-etl
+python etl.py                         # ou docker run --rm --env-file .env ibm-attrition-etl
 
 # 6. Tests
 pip install -r requirements-tests.txt
 pytest -v
 ```
+
+---
+
+## Auteur
+
+**Ahmed Mehdi SEMAR** — Livrable Bloc 4 (MLOps), certification AIA — Architecte en
+Intelligence Artificielle.
+Dépôt associé : [train-repo](https://github.com/semarmehdi/train-repo)
+(entraînement automatisé et monitoring).
