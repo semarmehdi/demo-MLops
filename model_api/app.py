@@ -31,10 +31,6 @@ tags_metadata = [
         "name": "Introduction Endpoints",
         "description": "Simple endpoints to try out!",
     },
-    {
-        "name": "Data Preview",
-        "description": "An endpoint to look at a sample of the original dataset.",
-    },
     {"name": "Machine Learning", "description": "Prediction Endpoint."},
 ]
 
@@ -105,10 +101,33 @@ async def index():
     return message
 
 
+@app.on_event("startup")
+def load_model_sync():
+    global MODEL
+    print(f"🚀 [INFO] Attempting to load model: {MODEL_URI}")
+    try:
+        # On attend que le chargement soit fini avant de rendre l'API disponible
+        # flaveur sklearn -> Pipeline imblearn complete (predict + predict_proba)
+        MODEL = mlflow.sklearn.load_model(MODEL_URI)
+        print("✅ [INFO] Model loaded successfully!")
+    except Exception as e:
+        print(f"❌ [ERROR] Failed to load model: {e}")
+        # En cas d'échec, on laisse MODEL à None pour que /health le signale
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "model_uri": MODEL_URI,
+        "model_loaded": MODEL is not None,
+    }
+
+
 @app.get("/preview", tags=["Data Preview"])
 async def preview(ligne: int):
     """
-    Append a new blog article into the database which is a `.csv` file.
+    Get the preview of the train dataset
     """
     df = pd.read_excel(
         "https://full-stack-assets.s3.eu-west-3.amazonaws.com/Deployment/ibm_hr_attrition.xlsx",
@@ -125,13 +144,22 @@ async def predict(predictionFeatures: PredictionFeatures):
     Prediction of attrition!
     """
 
-    ####### version de Mehdi #######
-
+    # Transformation de l'entrée en DataFrame
     employee_info = pd.DataFrame([predictionFeatures.dict()])
 
+    # Récupération de la classe prédite
     prediction = MODEL.predict(employee_info)
 
-    response = {"prediction": prediction.tolist()[0]}
+    # Récupération des probabilités (renvoie généralement un tableau 2D, ex: [[0.8, 0.2]])
+    probabilities = MODEL.predict_proba(employee_info)
+
+    # Construction de la réponse attendue par le test
+    response = {
+        "prediction": prediction.tolist()[0],
+        "proba_0": probabilities[0][0],  # Probabilité pour la classe 0
+        "proba_1": probabilities[0][1],  # Probabilité pour la classe 1
+    }
+
     return response
 
 
