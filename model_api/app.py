@@ -16,10 +16,6 @@ Welcome to Mehdi MLops demo API. This app is made for you to understand how Fast
 Here are two endpoints you can try:
 * `/`: **GET** request that display a simple default message.
 
-## Data Preview
-
-Just a quick look at the train data. 
-
 ## Machine Learning
 
 This is a Machine Learning endpoint that predict attrition given all the data of the employee. Here is the endpoint:
@@ -137,3 +133,25 @@ async def predict(predictionFeatures: PredictionFeatures):
 
     response = {"prediction": prediction.tolist()[0]}
     return response
+
+
+@app.post("/reload-model", tags=["Machine Learning"])
+async def reload_model():
+    """
+    Force le rechargement du modèle depuis MLflow sans redémarrer l'API.
+    """
+    global MODEL  # Indique à Python qu'on veut modifier la variable globale
+
+    try:
+        # On va chercher la dernière version (ou le tag 'production') sur MLflow
+        MODEL = mlflow.sklearn.load_model(MODEL_URI)
+
+        return {
+            "status": "success",
+            "message": f"Le modèle {REGISTERED_MODEL_NAME}@{MODEL_ALIAS} a été rechargé avec succès !",
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Erreur lors du rechargement du modèle : {str(e)}",
+        }

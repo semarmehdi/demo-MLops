@@ -17,6 +17,7 @@ __pycache__/
 model_api_HF/
 mlflow_HF/
 ibmattritionapi/
+apimlopsHF/
 
 # docker
 *.pid

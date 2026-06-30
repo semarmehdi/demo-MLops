@@ -85,8 +85,8 @@ if __name__ == "__main__":
     # Pipeline
     # n_estimators = int(args.n_estimators)
     # min_samples_split = int(args.min_samples_split)
-    n_estimators = 100
-    min_samples_split = 2
+    n_estimators = 150
+    min_samples_split = 8
 
     model = Pipeline(
         steps=[
