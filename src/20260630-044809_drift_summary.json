@@ -1,0 +1,7 @@
+{
+  "window_hours": 24,
+  "threshold": 0.5,
+  "drift_share": 0.8076923076923077,
+  "drifted_columns": 21,
+  "drift_detected": true
+}
